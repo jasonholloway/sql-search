@@ -1,55 +1,91 @@
 package org.woodpigeon.sqlsearch
 
-import cats.effect.IO
+import cats.Monad
+import cats.data.Kleisli
+import cats.free.Free
 import com.outr.lucene4s.Lucene
+import com.outr.lucene4s.document.DocumentBuilder
+import doobie.util.transactor.Transactor
 import org.http4s._
 import org.http4s.implicits._
 import org.specs2.matcher.MatchResult
 import org.specs2.mutable.Specification
-
-import doobie.imports._
+import com.outr.lucene4s._
 import cats.instances.int._
 import cats.syntax.applicative._
+import doobie.imports._
+// import doobie.syntax.stream._
+import cats.effect.IO
+import cats.effect.IO._
+import fs2.Stream
+
+
+trait Strategy {
+  type Deps = (Transactor[IO], Lucene)
+
+  def updateAll: Deps => Stream[IO, Any]
+  def updateSome(ids: Set[Int]): Deps => Stream[IO, Any]
+}
+
+//again, here we are: LuceneIO
+//is a clump of real activity,
+//but taking some lucene kinda thing as its input
+
+object companyStrategy extends Strategy {
+
+  def updateAll(): Deps => Stream[IO, Any] = {
+    case (xa, lucene) => 
+      val name = lucene.create.field[String]("name")
+      sql"SELECT Id, Name FROM laterooms.laterooms.Company"
+        .query[(Int, String)]
+        .stream.transact(xa)
+        .flatMap {
+          case (_, n) =>
+            Stream.eval(IO { println(n); lucene.doc().fields(name(n)).index() })
+        }
+        .take(50)
+  }
+
+  def updateSome(ids: Set[Int]): Deps => Stream[IO, Any] = {
+    case (xa, lucene) => 
+      ???
+  }
+}
+
 
 class SqlSearchSpec extends Specification {
 
+  
   "Searching by name" >> {
 
-    import java.util.logging.{Logger, Level,ConsoleHandler}
+    // import java.util.logging.{Logger, Level,ConsoleHandler}
 
-    val logger = Logger.getLogger("com.microsoft.sqlserver.jdbc");
-    logger.setLevel(Level.INFO);
+    // val logger = Logger.getLogger("com.microsoft.sqlserver.jdbc");
+    // logger.setLevel(Level.FINER);
 
-    val handler = new ConsoleHandler()
-    handler.setLevel(Level.INFO)
-    logger.addHandler(handler)
+    // val handler = new ConsoleHandler()
+    // handler.setLevel(Level.FINER)
+    // logger.addHandler(handler)
 
 
     "queries registered tables" >> {
+
+      import cats.free.Free.catsFreeMonadForFree
+
       val xa = Transactor.fromDriverManager[IO](
         driver = "com.microsoft.sqlserver.jdbc.SQLServerDriver",
         url = "jdbc:sqlserver://dev-sql-02.laterooms.io;databaseName=laterooms",
-        user = "developer",
-        pass = "")
-
-      val query = sql"SELECT TOP 10000 Id, Name FROM laterooms.laterooms.Company".query[(Int, String)]
-      val res = query.process.take(100).transact(xa).compile.toList.unsafeRunSync()
-      println(res)
-
-
-      import com.outr.lucene4s._
+        user = System.getenv("DB_USER"),
+        pass = System.getenv("DB_PASS"))
 
       val lucene = new DirectLucene(List("wibble"))
 
-
-
-      val name = lucene.create.field[String]("name")
-
-      res.foreach(r => lucene.doc().fields(name(r._2)).index())
+      val out = companyStrategy
+        .updateAll()(xa, lucene)
+        .run.unsafeRunSync()
 
       val p = lucene.query().search()
-      println(p)
-
+      println(p.results)
 
       true
     }
